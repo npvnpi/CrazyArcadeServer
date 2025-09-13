@@ -4,9 +4,8 @@
     {
         static void Main(string[] args)
         {
-            var server = new AsyncServer();
+            var server = new CrazyArcadeServer();
             server.Start(5000);
-
             Console.ReadLine();
         }
     }
