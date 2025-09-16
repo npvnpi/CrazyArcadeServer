@@ -13,14 +13,15 @@ namespace CrazyArcadeServer
 
         // Recv
         private readonly SocketAsyncEventArgs _recvArgs;
-        private readonly byte[] _recvBuffer = new byte[4096];
+        private RecvBuffer _recvBuffer = new RecvBuffer();
 
         // Send
         private readonly SocketAsyncEventArgs _sendArgs;
         private readonly Queue<ArraySegment<byte>> _sendQ = new();
         private readonly object _sendLock = new();
         private bool _sending;
-
+        private ArraySegment<byte>? _sendingSeg;
+        private int _sendingOffset; // seg.Offset 기준 상대 오프셋
 
         public Connection(Socket socket)
         {
@@ -28,7 +29,8 @@ namespace CrazyArcadeServer
 
             // --- Recv SAEA ---
             _recvArgs = new SocketAsyncEventArgs();
-            _recvArgs.SetBuffer(_recvBuffer, 0, _recvBuffer.Length);
+            var writable = _recvBuffer.GetWritableSegment();
+            _recvArgs.SetBuffer(writable.Array, writable.Offset, writable.Count);
             _recvArgs.UserToken = this;
             _recvArgs.Completed += RecvCompleted;
 
@@ -37,6 +39,15 @@ namespace CrazyArcadeServer
             _sendArgs.UserToken = this;
             _sendArgs.Completed += SendCompleted;
         }
+
+        public void Send(ReadOnlySpan<byte> data)
+        {
+            if (data.Length == 0) return;
+            var copy = new byte[data.Length];
+            data.CopyTo(copy);
+            EnqueueSend(copy);
+        }
+
 
         public void StartReceive()
         {
@@ -64,13 +75,12 @@ namespace CrazyArcadeServer
 
             try
             {
-                // 수신 데이터 처리 (예: 에코)
-                string text = Encoding.UTF8.GetString(e.Buffer, e.Offset, e.BytesTransferred);
-                Console.WriteLine($"[RECV] {_socket.RemoteEndPoint} : {text}");
+                _recvBuffer.AdvanceWrite(e.BytesTransferred);  // ✅ WritePos 전진
 
-                // 에코(그대로 돌려보내기)
-                byte[] echo = Encoding.UTF8.GetBytes($"echo: {text}");
-                EnqueueSend(echo);
+                ParsePackets();
+
+                var writable = _recvBuffer.GetWritableSegment();
+                _recvArgs.SetBuffer(writable.Array, writable.Offset, writable.Count);
 
                 // 다음 수신
                 bool pending = _socket.ReceiveAsync(_recvArgs);
@@ -82,6 +92,24 @@ namespace CrazyArcadeServer
                 Close();
             }
         }
+
+        private void ParsePackets()
+        {
+            while (true)
+            {
+                var readable = _recvBuffer.GetReadableSegment();
+                if (readable.Count < 2) break; // 헤더 미도착
+
+                ushort len = BitConverter.ToUInt16(readable.Array!, readable.Offset);
+                if (readable.Count < len) break; // 패킷 전체 미도착
+
+                // 패킷 처리: readable.Array![readable.Offset .. readable.Offset+len]
+                // HandlePacket(new ArraySegment<byte>(readable.Array!, readable.Offset, len));
+
+                _recvBuffer.Read(len); // ✅ 소비
+            }
+        }
+
 
         // 안전한 비동기 전송: 큐에 넣고, 현재 전송 중이 아니면 시작
         private void EnqueueSend(byte[] data)
@@ -100,19 +128,32 @@ namespace CrazyArcadeServer
         private void TryDequeueAndSend()
         {
             ArraySegment<byte> seg;
+            int offset, remain;
 
             lock (_sendLock)
             {
-                if (_sendQ.Count == 0)
+                while (true)
                 {
-                    _sending = false;
-                    return;
-                }
-                seg = _sendQ.Peek(); // 보내고 나서 성공 시 Dequeue
-            }
+                    if (_sendingSeg == null)
+                    {
+                        if (_sendQ.Count == 0) { _sending = false; return; }
+                        _sendingSeg = _sendQ.Dequeue();
+                        _sendingOffset = 0;
+                    }
 
-            // 부분 전송 대비: _sendArgs.Buffer/Offset/Count를 세팅
-            _sendArgs.SetBuffer(seg.Array, seg.Offset, seg.Count);
+                    seg = _sendingSeg.Value;
+                    offset = seg.Offset + _sendingOffset;
+                    remain = seg.Count - _sendingOffset;
+
+                    if (remain > 0) break; // ✅ 보낼 게 있을 때만 탈출
+
+                    // 남은 게 없으면 다음 세그먼트 탐색
+                    _sendingSeg = null;
+                    _sendingOffset = 0;
+                }
+
+                _sendArgs.SetBuffer(seg.Array!, offset, remain);
+            }
 
             try
             {
@@ -126,7 +167,8 @@ namespace CrazyArcadeServer
             }
         }
 
-        private void SendCompleted(object sender, SocketAsyncEventArgs e)
+
+        private void SendCompleted(object? sender, SocketAsyncEventArgs e)
         {
             if (e.SocketError != SocketError.Success || e.BytesTransferred == 0)
             {
@@ -137,40 +179,27 @@ namespace CrazyArcadeServer
 
             lock (_sendLock)
             {
-                // 부분 전송 처리
-                var cur = _sendQ.Peek();
-                int sent = e.BytesTransferred;
+                _sendingOffset += e.BytesTransferred;
+                var seg = _sendingSeg!.Value;
 
-                if (sent < cur.Count)
+                if (_sendingOffset >= seg.Count)
                 {
-                    // 아직 남았다 → 남은 구간으로 다시 세팅하고 재전송
-                    var remain = new ArraySegment<byte>(cur.Array!, cur.Offset + sent, cur.Count - sent);
-                    _sendQ.Dequeue();      // 기존 항목 제거
-                    _sendQ.Enqueue(remain); // 앞에 다시 붙이지 말고, 현재 위치 유지 위해 새로 맨 앞으로 넣는 패턴 대신
-                                            // 간단히: 큐를 비우고 remain을 제일 앞으로 넣고 싶다면 다른 자료구조를 쓰자.
-                                            // 여기서는 간단화를 위해 아래처럼 '즉시 다시 보냄' 처리.
-                                            // 즉시 다시 보내기 위해 큐 정리
-                    var tmp = new Queue<ArraySegment<byte>>();
-                    tmp.Enqueue(remain);
-                    while (_sendQ.Count > 0) tmp.Enqueue(_sendQ.Dequeue());
-                    while (tmp.Count > 0) _sendQ.Enqueue(tmp.Dequeue());
-                }
-                else
-                {
-                    // 이번 항목 전송 완료
-                    _sendQ.Dequeue();
+                    // 현 항목 완료 → 다음 항목 준비
+                    _sendingSeg = null;
+                    _sendingOffset = 0;
                 }
             }
 
-            // 다음 항목 있으면 계속 전송
+            // 이어서 계속
             TryDequeueAndSend();
         }
 
+        private int _closed;
         private void Close()
         {
+            if (Interlocked.Exchange(ref _closed, 1) != 0) return;
             try { _socket.Shutdown(SocketShutdown.Both); } catch { }
             try { _socket.Close(); } catch { }
-
             _recvArgs.Completed -= RecvCompleted;
             _sendArgs.Completed -= SendCompleted;
             _recvArgs.Dispose();

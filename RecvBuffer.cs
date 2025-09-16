@@ -8,18 +8,22 @@ namespace CrazyArcadeServer
 {
     internal class RecvBuffer
     {
-        public byte[] MyBuffer {  get; set; } = new byte[4096 * 5];
+        private const int Chunk = 4096;
+        private const int Capacity = Chunk * 5;
+
+        public byte[] MyBuffer {  get; set; } = new byte[Capacity];
         public int WritePos { get; set; } = 0;
         public int ReadPos { get; set; } = 0;
 
-        public int DataLength()
-        {
-            return WritePos - ReadPos;
-        }
+        public int DataLength => WritePos - ReadPos;
+        public int FreeSpace => Capacity - WritePos;
 
         // [x][1/r][2][3][w]
         public void Read(int numOfBytes) 
         {
+            if (numOfBytes < 0 || numOfBytes > DataLength)
+                throw new ArgumentOutOfRangeException(nameof(numOfBytes));
+
             // 데이터 읽기
             ReadPos += numOfBytes;
             // 읽다가 ReadPos랑 WritePos가 같아지면 0번 오프셋으로 이동
@@ -30,21 +34,79 @@ namespace CrazyArcadeServer
             }
         }
 
-        public void Write(int numOfBytes) 
+        public void AdvanceWrite(int numOfBytes)
         {
+            if (numOfBytes < 0 || numOfBytes > FreeSpace)
+                throw new ArgumentOutOfRangeException(nameof(numOfBytes));
+
             WritePos += numOfBytes;
 
-            // 4번째 청크까지 왔다는것은 이제 버퍼 Overflow가 얼마 안남았다는거...
-            if (WritePos >= 4096 * 4) 
+            // 여유가 너무 줄어들면 앞으로 당겨서 공간 확보
+            if (WritePos >= Capacity - Chunk) // 4번째 청크 근처
+                Compact();
+        }
+
+        // 소켓 Recv 받을 때 이 세그먼트로 바로 넣기
+        public ArraySegment<byte> GetWritableSegment()
+            => new ArraySegment<byte>(MyBuffer, WritePos, FreeSpace);
+
+        // 파싱할 때 읽을 수 있는 바이트 범위
+        public ArraySegment<byte> GetReadableSegment()
+            => new ArraySegment<byte>(MyBuffer, ReadPos, DataLength);
+
+        // 외부 버퍼에서 데이터 복사해서 넣고 싶을 때
+        public void WriteBytes(byte[] src, int offset, int count)
+        {
+            if (src == null) throw new ArgumentNullException(nameof(src));
+            if ((uint)offset > src.Length || (uint)count > src.Length - offset)
+                throw new ArgumentOutOfRangeException();
+
+            EnsureFree(count);
+            Buffer.BlockCopy(src, offset, MyBuffer, WritePos, count);
+            WritePos += count;
+
+            if (WritePos >= Capacity - Chunk)
+                Compact();
+        }
+
+        // 바이트를 꺼내서 새 배열로 반환 (필요하면)
+        public byte[] ReadBytes(int count)
+        {
+            if (count < 0 || count > DataLength)
+                throw new ArgumentOutOfRangeException(nameof(count));
+
+            byte[] dst = new byte[count];
+            Buffer.BlockCopy(MyBuffer, ReadPos, dst, 0, count);
+            Read(count);
+            return dst;
+        }
+
+
+        private void Compact()
+        {
+            int len = DataLength;
+            if (len > 0)
             {
-                int dataSize = DataLength();
-                // Buffer ReadPos부터 WritePos까지의 부분을 o부터 DataSize까지 복사해줘야하는데 C#에서 어떻게해?
-                Buffer.BlockCopy(MyBuffer, ReadPos, MyBuffer, 0, dataSize);
-
+                Buffer.BlockCopy(MyBuffer, ReadPos, MyBuffer, 0, len);
                 ReadPos = 0;
-                WritePos = dataSize;
+                WritePos = len;
             }
+            else
+            {
+                ReadPos = 0;
+                WritePos = 0;
+            }
+        }
 
+        private void EnsureFree(int needed)
+        {
+            if (needed <= FreeSpace) return;
+
+            // 컴팩트로 해결 가능하면 우선 시도
+            Compact();
+
+            if (needed > FreeSpace)
+                throw new InvalidOperationException("RecvBuffer capacity exceeded.");
         }
     }
 }
